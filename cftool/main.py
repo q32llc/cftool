@@ -14,9 +14,12 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -24,37 +27,18 @@ import requests
 import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-from rich.console import Console
-from rich.table import Table
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Environment & session
 # ──────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-
-class CFToolError(Exception):
-    """Custom error for cftool to short-circuit on expected errors."""
-
-    pass
-
-
-CF_API_TOKEN = os.getenv("CF_API_TOKEN")
-if not CF_API_TOKEN:
-    raise CFToolError("CF_API_TOKEN missing")
-SESSION = requests.Session()
-SESSION.headers.update(
-    {
-        "User-Agent": "cftool/1.0",
-        "Authorization": f"Bearer {CF_API_TOKEN}",
-        "Content-Type": "application/json",
-    }
-)
+CF_API_TOKEN = os.environ["CF_API_TOKEN"]
 CF_API = "https://api.cloudflare.com/client/v4"
 
-console = Console()
 log = logging.getLogger("cftool")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+my_ip = requests.get("https://checkip.amazonaws.com").text.strip()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -68,20 +52,93 @@ class DNSRecord:
     ttl: int | None = None
     priority: int | None = None
     proxied: bool | None = None
+    id: str | None = None
+
+    def is_equal(self, other: object) -> bool:
+        diff = {}
+        if self.priority != other.priority:
+            diff["priority"] = (self.priority, other.priority)
+        if self.content.rstrip(".") != other.content.rstrip("."):
+            diff["content"] = (self.content, other.content)
+        if bool(self.proxied) != bool(other.proxied) and self.type in ("A", "AAAA", "CNAME"):
+            diff["proxied"] = (self.proxied, other.proxied)
+        if self.ttl != other.ttl and self.ttl != 1:
+            diff["ttl"] = (self.ttl, other.ttl)
+        if self.name != other.name:
+            diff["name"] = (self.name, other.name)
+        if self.type != other.type:
+            diff["type"] = (self.type, other.type)
+        if diff:
+            log.info(f"MX record {self.name} has changed from {diff}")
+
+        if self.type == "MX":
+            assert self.priority
+            assert other.priority
+
+        is_equal = (
+            self.type == other.type
+            and self.name == other.name
+            and self.content.rstrip(".") == other.content.rstrip(".")
+            and (
+                bool(self.proxied) == bool(other.proxied) or self.type not in ("A", "AAAA", "CNAME")
+            )
+            and (self.ttl == other.ttl or self.ttl == 1)
+            and (  # 1 is auto
+                self.priority == other.priority or self.type not in ("MX", "SRV", "URI")
+            )
+        )
+
+        if not is_equal:
+            log.error(self.__dict__)
+            log.error(other.__dict__)
+            assert diff
+
+        return is_equal
 
     @classmethod
-    def from_cf(cls, r: Dict) -> "DNSRecord":
-        return cls(
-            r["type"], r["name"], r["content"], r.get("ttl"), r.get("priority"), r.get("proxied")
+    def from_cf(cls, r: Dict, domain: str) -> "DNSRecord":
+        if r["type"] == "MX":
+            log.info(f"CF record {r}")
+            assert r["priority"]
+
+        if r["type"] == "TXT":
+            if r["content"].startswith('"') and r["content"].endswith('"'):
+                content = re.findall(r'"([^"]*)"', r["content"])
+                if len(content) >= 1:
+                    # merge into one quoted string
+                    r["content"] = '"' + "".join(content) + '"'
+
+        name = re.sub(rf"\b{domain}$", "", r["name"]).strip(".")
+        if name == "":
+            name = "@"
+        ret = cls(
+            r["type"].upper(),
+            name,
+            r["content"],
+            r.get("ttl"),
+            r.get("priority"),
+            r.get("proxied"),
+            r.get("id"),
         )
+        if ret.type == "MX":
+            assert ret.priority
+        return ret
 
     def key(self) -> tuple:
-        return (
-            self.type.upper(),
-            self.name.rstrip("."),
-            self.content.rstrip("."),
-            self.priority or 0,
-        )
+        # records that can't be duplicated per type and name
+        if self.type in ("A", "AAAA", "CNAME"):
+            return (
+                self.type.upper(),
+                self.name.rstrip("."),
+            )
+        else:
+            content = self.content.rstrip(".")
+            return (
+                self.type.upper(),
+                self.name.rstrip("."),
+                content,
+                self.priority or 0,
+            )
 
     def payload(self) -> Dict:
         d = {"type": self.type.upper(), "name": self.name, "content": self.content}
@@ -101,6 +158,8 @@ class Forward(BaseModel):
     from_: str = Field(..., alias="from")
     to: str
 
+    model_config = dict(populate_by_name=True)
+
 
 class Redirect(BaseModel):
     source: str
@@ -118,8 +177,7 @@ class Extra(BaseModel):
 
 
 class Site(BaseModel):
-    dns_provider: str
-    origin: str | None = None
+    registrar: str
     cache_bypass: List[str] = []
     records: List[Extra] = []
     mail_forwarding: List[Forward] = []
@@ -134,78 +192,122 @@ class Config(BaseModel):
 # ──────────────────────────────────────────────────────────────────────────────
 #  Registrar providers  (Namecheap + Name.com)
 # ──────────────────────────────────────────────────────────────────────────────
-class Namecheap:
+class BaseProvider(ABC):
+    @abstractmethod
+    def export_dns(self, domain: str) -> List[DNSRecord]: ...
+
+    @abstractmethod
+    def export_forward(self, domain: str) -> List[Forward]: ...
+
+    @abstractmethod
+    def export_redirects(self, domain: str) -> List[Redirect]: ...
+
+    @abstractmethod
+    def has_domain(self, domain: str) -> bool: ...
+
+    @abstractmethod
+    def set_ns(self, domain: str, ns: List[str]): ...
+
+
+class Namecheap(BaseProvider):
     API = "https://api.namecheap.com/xml.response"
 
     def __init__(self):
-        req = ("NC_API_USER", "NC_API_KEY", "NC_USERNAME", "NC_API_IP")
-        missing = [v for v in req if not os.getenv(v)]
-        if missing:
-            raise CFToolError(f"Namecheap missing: {', '.join(missing)}")
-        self.u, self.k, self.un, self.ip = map(os.getenv, req)
+        self.u = os.environ["NC_API_USER"]
+        self.k = os.environ["NC_API_KEY"]
+        self.headers = {
+            "User-Agent": "cftool/1.0",
+        }
+        self.ns = {"nc": "http://api.namecheap.com/xml.response"}
+        self._cache = {}
 
     def _call(self, cmd: str, params: Dict) -> str:
         p = {
             "ApiUser": self.u,
             "ApiKey": self.k,
-            "UserName": self.un,
+            "UserName": self.u,
             "Command": cmd,
-            "ClientIp": self.ip,
+            "ClientIp": my_ip,
         } | params
-        r = SESSION.get(self.API, params=p, timeout=60)
+        r = requests.get(self.API, params=p, headers=self.headers, timeout=60)
         r.raise_for_status()
         return r.text
 
     def _parse_xml(self, xml: str) -> ET.Element:
         root = ET.fromstring(xml)
-        if error := root.find(".//Errors/Error"):
+        if error := root.find(".//nc:Errors/nc:Error", self.ns):
             raise RuntimeError(f"Namecheap API error: {error.text}")
         return root
 
+    def _get_all_pages(self, cmd: str, params: Dict, pattern: str) -> List[ET.Element]:
+        cache_key = (cmd, tuple(sorted(params.items())), pattern)
+        if cached := self._cache.get(cache_key):
+            return cached
+
+        params["PageSize"] = 100
+        params["Page"] = 1
+        xml = self._call(cmd, params)
+        root = self._parse_xml(xml)
+        els = root.findall(f".//nc:{pattern}", self.ns)
+        while len(els) == 100:
+            params["Page"] += 1
+            xml = self._call(cmd, params)
+            root = self._parse_xml(xml)
+            els += root.findall(f".//nc:{pattern}", self.ns)
+        self._cache[cache_key] = els
+        return els
+
+    def has_domain(self, domain: str) -> bool:
+        els = self._get_all_pages("namecheap.domains.getList", {}, "Domain")
+        domains = {el.attrib["Name"].lower() for el in els}
+        return domain.lower() in domains
+
     def export_dns(self, domain: str) -> List[DNSRecord]:
         sld, tld = domain.split(".", 1)
-        xml = self._call("namecheap.domains.dns.getHosts", {"SLD": sld, "TLD": tld})
-        root = self._parse_xml(xml)
+
+        els = self._get_all_pages(
+            "namecheap.domains.dns.getHosts", {"SLD": sld, "TLD": tld}, "host"
+        )
 
         records = []
-        for host in root.findall(".//host"):
+        for host in els:
             record_type = host.attrib["Type"]
             name = host.attrib["Name"] or "@"
             content = host.attrib["Address"]
-            ttl = int(host.attrib.get("TTL", "1800"))
-            priority = int(host.attrib.get("MXPref", "0")) or None
+            ttl = int(host.attrib.get("TTL"))
+            priority = int(host.attrib.get("MXPref", None))
 
             # Handle URL redirects
             if record_type in {"URL", "URL301"}:
                 continue  # These are handled by export_redirects
 
             records.append(
-                DNSRecord(type=record_type, name=name, content=content, ttl=ttl, priority=priority)
+                DNSRecord(
+                    type=record_type, name=name.lower(), content=content, ttl=ttl, priority=priority
+                )
             )
         return records
 
     def export_forward(self, domain: str) -> List[Forward]:
         sld, tld = domain.split(".", 1)
-        xml = self._call(
-            "namecheap.domains.dns.getHosts", {"SLD": sld, "TLD": tld, "EmailType": "MXE"}
+        els = self._get_all_pages(
+            "namecheap.domains.dns.getEmailForwarding", {"DomainName": domain}, "Forward"
         )
-        root = self._parse_xml(xml)
 
         forwards = []
-        for host in root.findall(".//host"):
-            if host.attrib["Type"] == "MXE":
-                forwards.append(
-                    Forward(from_=f"{host.attrib['Name']}@{domain}", to=host.attrib["Address"])
-                )
+        for host in els:
+            mailbox = host.attrib["mailbox"]
+            forwards.append(Forward(from_=f"{mailbox}@{domain}", to=host.text))
         return forwards
 
     def export_redirects(self, domain: str) -> List[Redirect]:
         sld, tld = domain.split(".", 1)
-        xml = self._call("namecheap.domains.dns.getHosts", {"SLD": sld, "TLD": tld})
-        root = self._parse_xml(xml)
+        els = self._get_all_pages(
+            "namecheap.domains.dns.getHosts", {"SLD": sld, "TLD": tld}, "host"
+        )
 
         redirects = []
-        for host in root.findall(".//host"):
+        for host in els:
             if host.attrib["Type"] in {"URL", "URL301"}:
                 name = host.attrib["Name"] or "@"
                 source = f"https://{name}.{domain}" if name != "@" else f"https://{domain}"
@@ -218,82 +320,106 @@ class Namecheap:
                 )
         return redirects
 
-    def set_ns(self, domain: str, ns1: str, ns2: str):
+    def set_ns(self, domain: str, ns: List[str]):
         sld, tld = domain.split(".", 1)
         self._call(
             "namecheap.domains.dns.setCustom",
-            {"SLD": sld, "TLD": tld, "Nameservers": f"{ns1},{ns2}"},
+            {"SLD": sld, "TLD": tld, "Nameservers": ",".join(ns)},
         )
 
 
-class NameDotCom:
+class NameDotCom(BaseProvider):
     API = "https://api.name.com/v4"
 
     def __init__(self):
-        if not (os.getenv("NAMEDOTCOM_USER") and os.getenv("NAMEDOTCOM_TOKEN")):
-            raise CFToolError("Name.com creds missing")
-        self.auth = (os.getenv("NAMEDOTCOM_USER"), os.getenv("NAMEDOTCOM_TOKEN"))
+        self.auth = (os.environ["NAMEDOTCOM_USER"], os.environ["NAMEDOTCOM_TOKEN"])
+        self.headers = {
+            "User-Agent": "cftool/1.0",
+        }
+
+    def has_domain(self, domain: str) -> bool:
+        r = requests.get(
+            f"{self.API}/domains/{domain}", auth=self.auth, headers=self.headers, timeout=60
+        )
+        r.raise_for_status()
+        return r.status_code == 200
 
     def export_dns(self, domain: str) -> list[DNSRecord]:
-        r = SESSION.get(f"{self.API}/domains/{domain}/records", auth=self.auth, timeout=60)
-        if r.status_code != 200:
-            raise RuntimeError(r.text)
+        r = requests.get(
+            f"{self.API}/domains/{domain}/records", auth=self.auth, headers=self.headers, timeout=60
+        )
+        r.raise_for_status()
         return [
             DNSRecord(
                 type=rec["type"],
-                name=rec["host"] or "@",
+                name=(rec.get("host") or "@").lower(),
                 content=rec["answer"],
-                ttl=rec.get("ttl"),
+                ttl=rec.get("ttl") if rec.get("ttl", 300) != 300 else None,
                 priority=rec.get("priority"),
             )
             for rec in r.json().get("records", [])
         ]
 
     def export_forward(self, domain: str) -> list[Forward]:
-        r = SESSION.get(
-            f"{self.API}/domains/{domain}/email/forwardings", auth=self.auth, timeout=60
+        mx_required = f"mx.{domain}.cust.a.hostedemail.com"
+        active_mx = any(
+            r
+            for r in self.export_dns(domain)
+            if r.type == "MX" and r.content.lower() == mx_required
+        )
+        r = requests.get(
+            f"{self.API}/domains/{domain}/email/forwarding",
+            auth=self.auth,
+            headers=self.headers,
+            timeout=60,
         )
         if r.status_code != 200:
             return []
         data = r.json().get("emailForwarding", [])
-        return [
-            Forward(from_=f["email"] or f["alias"] + f"@{domain}", to=f["forwardTo"]) for f in data
-        ]
+        if not active_mx:
+            if len(data):
+                log.warning(f"Domain {domain} has email forwarding but no active MX record")
+            return []
+        return [Forward(from_=f["emailBox"] + f"@{domain}", to=f["emailTo"]) for f in data]
 
     def export_redirects(self, domain: str) -> list[Redirect]:
-        r = SESSION.get(f"{self.API}/domains/{domain}/url/forwardings", auth=self.auth, timeout=60)
-        if r.status_code != 200:
-            return []
+        r = requests.get(
+            f"{self.API}/domains/{domain}/url/forwarding",
+            auth=self.auth,
+            headers=self.headers,
+            timeout=60,
+        )
+        r.raise_for_status()
         data = r.json().get("urlForwarding", [])
         redirects = []
         for rd in data:
-            source = rd.get("source") or rd.get("subdomain", "@")
-            destination = rd.get("forwardTo") or rd.get("destination")
-            code = 301 if rd.get("type", "redirect").lower() == "redirect" else 302
+            source = rd.get("host", "@")
+            destination = rd["forwardsTo"]
+            code = 301
             redirects.append(Redirect(source=source, destination=destination, code=code))
         return redirects
 
-    def set_ns(self, domain: str, ns1: str, ns2: str):
-        r = SESSION.post(
+    def set_ns(self, domain: str, ns: List[str]):
+        r = requests.post(
             f"{self.API}/domains/{domain}:setNameservers",
             auth=self.auth,
-            json={"nameservers": [ns1, ns2]},
+            headers=self.headers,
+            json={"nameservers": ns},
             timeout=60,
         )
         if r.status_code >= 400:
             raise RuntimeError(r.text)
 
 
-PROVIDERS = {"namecheap": Namecheap(), "name.com": NameDotCom()}
+PROVIDERS: dict[str, BaseProvider] = {"namecheap": Namecheap(), "name.com": NameDotCom()}
 
 
 def detect_provider(domain: str) -> str:
+    name: str
+    prov: BaseProvider
     for name, prov in PROVIDERS.items():
-        try:
-            prov.export_dns(domain)  # type: ignore[attr-defined]
+        if prov.has_domain(domain):
             return name
-        except Exception:
-            continue
     raise RuntimeError(f"No provider matched {domain}")
 
 
@@ -301,7 +427,12 @@ def detect_provider(domain: str) -> str:
 #  Cloudflare helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def cf_req(m: str, p: str, **kw):
-    r = SESSION.request(m, f"{CF_API}{p}", timeout=60, **kw)
+    headers = {
+        "User-Agent": "cftool/1.0",
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    r = requests.request(m, f"{CF_API}{p}", timeout=60, headers=headers, **kw)
     if r.status_code >= 400:
         raise RuntimeError(r.text[:200])
     data = r.json()
@@ -312,18 +443,25 @@ def cf_req(m: str, p: str, **kw):
 
 def cf_zone(domain: str) -> Dict:
     z = cf_req("GET", f"/zones?name={domain}")
-    return z[0] if z else cf_req("POST", "/zones", json={"name": domain})
+    return (
+        z[0]
+        if z
+        else cf_req("POST", "/zones", json={"name": domain, "account": {"id": cf_account()}})
+    )
 
 
-def cf_records(zone_id: str) -> Dict[tuple, DNSRecord]:
+def cf_records(zone_id: str, domain: str) -> Dict[tuple, DNSRecord]:
     return {
-        DNSRecord.from_cf(r).key(): DNSRecord.from_cf(r)
+        DNSRecord.from_cf(r, domain).key(): DNSRecord.from_cf(r, domain)
         for r in cf_req("GET", f"/zones/{zone_id}/dns_records?per_page=5000")
     }
 
 
-def cf_upsert(zone_id: str, rec: DNSRecord):
-    cf_req("POST", f"/zones/{zone_id}/dns_records", json=rec.payload())
+def cf_upsert(zone_id: str, rec: DNSRecord, already: DNSRecord | None):
+    if already is None:
+        cf_req("POST", f"/zones/{zone_id}/dns_records", json=rec.payload())
+    else:
+        cf_req("PATCH", f"/zones/{zone_id}/dns_records/{already.id}", json=rec.payload())
 
 
 def cf_cache(zone_id: str, paths: Sequence[str]):
@@ -349,14 +487,93 @@ def cf_cache(zone_id: str, paths: Sequence[str]):
     )
 
 
-def cf_email_rules(zone_id: str, fwds: Sequence[Forward]):
-    # ensure Email Routing is ON
-    cf_req("PUT", f"/zones/{zone_id}/email/routing/settings", json={"enabled": True})
-    # remove existing rules
-    for r in cf_req("GET", f"/zones/{zone_id}/email/routing/rules"):
-        cf_req("DELETE", f"/zones/{zone_id}/email/routing/rules/{r['id']}")
+# example of enabled-state for cf email routing
+# MX	drawme.io	91	route1.mx.cloudflare.net.
+# MX	drawme.io	4	route2.mx.cloudflare.net.
+# MX	drawme.io	68	route3.mx.cloudflare.net.
+# TXT	cf2024-1._domainkey.drawme.io		"v=DKIM1; h=sha256; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAiweykoi+o48IOGuP7GR3X0MOExCUDY/BCRHoWBnh3rChl7WhdyCxW3jgq1daEjPPqoi7sJvdg5hEQVsgVRQP4DcnQDVjGMbASQtrY4WmB1VebF+RPJB2ECPsEDTpeiI5ZyUAwJaVX7r6bznU67g7LvFq35yIo4sdlmtZGV+i0H4cpYH9+3JJ78km4KXwaf9xUJCWF6nxeD+qG6Fyruw1Qlbds2r85U9dkNDVAS3gioCvELryh1TxKGiVTkg4wqHTyHfWsp7KD3WQHYJn0RyfJJu6YEmL77zonn7p2SRMvTMP3ZEXibnC9gz3nnhR6wcYL8Q7zXypKTMD58bTixDSJwIDAQAB"
+# TXT	drawme.io		"v=spf1 include:_spf.mx.cloudflare.net ~all"
+
+
+def cf_email_rules(
+    zone_id: str, fwds: Sequence[Forward], existing: dict[tuple, DNSRecord], domain: str
+):
+    if not fwds:
+        return
+
+    ok_ids = set()
+    records = cf_req("GET", f"/zones/{zone_id}/email/routing/dns", json={})
+    for r in records:
+        d = DNSRecord.from_cf(r, domain)
+        log.debug(f"Processing {d.key()}")
+        already = existing.get(d.key())
+        if already is not None:
+            if already.is_equal(d):
+                log.debug(f"Skipping {d.payload()} because {d.key()} already exists, {already.id}")
+                ok_ids.add(already.id)
+                continue
+            else:
+                log.debug(f"Updating {d.payload()} from {already.payload()}")
+                ok_ids.add(already.id)
+        else:
+            log.info(f"Creating {d.payload()} because {d.key()} not in ({list(existing.keys())})")
+        cf_upsert(zone_id, d, already)
+
+    # cleanup any records that are no longer needed
+    log.info("OK IDs: " + str(ok_ids))
+    for r in existing.values():
+        needs_delete = r.id not in ok_ids and (
+            r.type == "MX"
+            or (r.type == "TXT" and r.content.lower().find("v=spf1") != -1)
+            or (r.type == "TXT" and r.content.lower().find("v=dkim1") != -1)
+        )
+        if needs_delete:
+            log.debug(f"Deleting {r.id} -> {r.payload()}")
+            cf_req("DELETE", f"/zones/{zone_id}/email/routing/dns_records/{r.id}")
+
+    cf_catch_all = cf_req("GET", f"/zones/{zone_id}/email/routing/rules/catch_all")
+    if cf_catch_all and cf_catch_all["enabled"]:
+        catch_all = cf_catch_all["actions"][0]["value"][0]
+    else:
+        catch_all = None
+    rules = cf_req("GET", f"/zones/{zone_id}/email/routing/rules")
+    log.info(f"Existing rules: {rules}")
+    existing = {}
+    for r in rules:
+        if not r["enabled"]:
+            continue
+        for match in r["matchers"]:
+            if match["type"] == "literal" and match["field"] == "to":
+                existing[match["value"].lower()] = {
+                    "id": r["id"],
+                    "to": r["actions"][0]["value"][0],
+                }
     # create new
     for f in fwds:
+        if f.from_ in existing:
+            already = existing[f.from_]
+            if already["to"] == f.to:
+                log.info(f"Skipping {f.from_} -> {f.to} because it already exists")
+                continue
+            log.info(f"Deleting existing rule {f.from_} -> {existing[f.from_]}")
+            cf_req("DELETE", f"/zones/{zone_id}/email/routing/rules/{existing[f.from_]['id']}")
+
+        if f.from_ == "*@" + domain:
+            if catch_all:
+                if catch_all == f.to:
+                    log.info(f"Skipping {f.from_} -> {f.to} because it already exists")
+                    continue
+                log.info(f"Deleting existing catch all rule {catch_all['id']}")
+            else:
+                log.info(f"Creating catch all rule {f.from_} -> {f.to}")
+            cf_req(
+                "PUT",
+                f"/zones/{zone_id}/email/routing/rules/catch_all",
+                json={"enabled": True, "actions": [{"type": "forward", "value": [f.to]}]},
+            )
+            continue
+
+        log.info(f"Creating rule {f.from_} -> {f.to}")
         cf_req(
             "POST",
             f"/zones/{zone_id}/email/routing/rules",
@@ -411,14 +628,12 @@ def cf_bulk_redirect(zone_id: str, redirects: Sequence[Redirect]):
         )
 
 
+@lru_cache(maxsize=1)
 def cf_account() -> str:
+    zs = cf_req("GET", "/zones")
+    for z in zs:
+        return z["account"]["id"]
     return cf_req("GET", "/user")["account"]["id"]
-
-
-FORWARD_MX = [
-    DNSRecord("MX", "@", "mx1.mail.cloudflare.net", priority=10, ttl=300),
-    DNSRecord("MX", "@", "mx2.mail.cloudflare.net", priority=20, ttl=300),
-]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -429,19 +644,30 @@ def cmd_export(domains: List[str]) -> None:
     for dom in domains:
         prov_name = detect_provider(dom)
         prov = PROVIDERS[prov_name]
-        console.print(f"[cyan]export {dom} via {prov_name}[/]")
-        recs = [r.__dict__ for r in prov.export_dns(dom)]  # type: ignore[attr-defined]
-        fwds = [f.dict(by_alias=True) for f in prov.export_forward(dom)]  # type: ignore[attr-defined]
-        reds = [r.dict() for r in prov.export_redirects(dom)]  # type: ignore[attr-defined]
+        log.info(f"Export {dom} via {prov_name}")
+        recs = [r.payload() for r in prov.export_dns(dom)]  # type: ignore[attr-defined]
+        fwds = [f.model_dump(by_alias=True, exclude_none=True) for f in prov.export_forward(dom)]  # type: ignore[attr-defined]
+        reds = [r.model_dump(by_alias=True, exclude_none=True) for r in prov.export_redirects(dom)]  # type: ignore[attr-defined]
+        for rec in recs:
+            if rec["type"] == "ANAME":
+                # cloudflare will magcally do the right thing
+                rec["type"] = "CNAME"
+            if rec["type"] == "CNAME":
+                rec["proxied"] = True
+            if rec["type"] == "A" and rec["name"] == "@":
+                rec["proxied"] = True
+            if rec["type"] == "AAAA" and rec["name"] == "@":
+                rec["proxied"] = True
+            if rec["type"] not in ("MX", "SRV", "URI"):
+                rec.pop("priority", None)
         yaml_out[dom] = {
-            "dns_provider": prov_name,
-            "origin": None,
-            "cache_bypass": [],
+            "registrar": prov_name,
             "records": recs,
-            "mail_forwarding": fwds,
-            "url_redirects": reds,
-            "extra_records": [],
         }
+        if fwds:
+            yaml_out[dom]["mail_forwarding"] = fwds
+        if reds:
+            yaml_out[dom]["url_redirects"] = reds
     yaml.dump({"domains": yaml_out}, sys.stdout, sort_keys=False)
 
 
@@ -449,49 +675,57 @@ def cmd_export(domains: List[str]) -> None:
 #  APPLY
 # ──────────────────────────────────────────────────────────────────────────────
 def cmd_apply(cfg_path: Path, dry: bool = False):
-    cfg = Config.parse_obj(yaml.safe_load(cfg_path.read_text()))
+    cfg = Config.model_validate(yaml.safe_load(cfg_path.read_text()))
 
-    tbl = Table("Domain", "dns rows", "new dns", "fwds", "redirects")
     for dom, site in cfg.domains.items():
         zone = cf_zone(dom)
         zid = zone["id"]
-        ns1, ns2 = zone["name_servers"][:2]
-        existing = cf_records(zid)
+        log.info(f"Zone: {zid}, ns: {zone['name_servers']}")
+        ns_s = zone["name_servers"][:2]
+        existing = cf_records(zid, dom)
+
+        log.debug(f"Existing records: {existing}")
 
         desired = [DNSRecord(**r.dict()) for r in site.records] + [
             DNSRecord(**e.dict()) for e in site.extra_records
         ]
-        if site.origin:
-            desired.append(DNSRecord("CNAME", "@", site.origin, ttl=300, proxied=True))
-        if site.mail_forwarding:
-            # replace provider MX with CF MX
-            desired = [r for r in desired if r.type != "MX"]
-            desired.extend(FORWARD_MX)
+
+        log.debug(f"Desired records: {desired}")
 
         created = 0
         for rec in {d.key(): d for d in desired}.values():
-            if rec.key() not in existing and not dry:
-                cf_upsert(zid, rec)
-                created += 1
-        if site.cache_bypass and not dry:
-            cf_cache(zid, site.cache_bypass)
-        if site.mail_forwarding and not dry:
-            cf_email_rules(zid, site.mail_forwarding)
-        if site.url_redirects and not dry:
-            cf_bulk_redirect(zid, site.url_redirects)
-
+            already = existing.get(rec.key())
+            if already is not None:
+                if already.is_equal(rec):
+                    log.debug(f"Skipping {rec.payload()} because {rec.key()} already exists")
+                    continue
+                else:
+                    log.debug(f"Updating {rec.payload()}")
+            else:
+                log.info(f"Creating {rec.payload()}")
+            if not dry:
+                cf_upsert(zid, rec, already)
+            created += 1
+        if site.cache_bypass:
+            log.info(f"Bypassing cache for {site.cache_bypass}")
+            if not dry:
+                cf_cache(zid, site.cache_bypass)
+        if site.mail_forwarding:
+            log.info(f"Creating email forwarding rules for {site.mail_forwarding}")
+            if not dry:
+                cf_email_rules(zid, site.mail_forwarding, existing, dom)
+        if site.url_redirects:
+            log.info(f"Creating bulk redirect for {site.url_redirects}")
+            if not dry:
+                raise  # untested
+                cf_bulk_redirect(zid, site.url_redirects)
         if not dry:
-            PROVIDERS[site.dns_provider].set_ns(dom, ns1, ns2)  # type: ignore[attr-defined]
+            log.info(f"Setting NS for {dom}")
+            PROVIDERS[site.registrar].set_ns(dom, ns_s)  # type: ignore[attr-defined]
 
-        tbl.add_row(
-            dom,
-            str(len(desired)),
-            str(created),
-            str(len(site.mail_forwarding)),
-            str(len(site.url_redirects)),
+        log.info(
+            f"Apply {dom} ({len(desired)} rows, {created} created, {len(site.mail_forwarding)} fwds, {len(site.url_redirects)} redirects)"
         )
-    console.print(tbl)
-    console.print("[green]dry-run[/]" if dry else "[green]apply complete[/]")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -502,10 +736,15 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     ex = sub.add_parser("export")
     ex.add_argument("domains", nargs="+")
+    ex.add_argument("--debug", "-D", action="store_true")
     aply = sub.add_parser("apply")
     aply.add_argument("config", type=Path)
     aply.add_argument("--dry", action="store_true")
+    aply.add_argument("--debug", "-D", action="store_true")
     args = ap.parse_args()
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        log.debug(args)
     if args.cmd == "export":
         cmd_export(args.domains)
     else:
