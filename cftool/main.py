@@ -183,6 +183,7 @@ class Site(BaseModel):
     mail_forwarding: List[Forward] = []
     url_redirects: List[Redirect] = []
     extra_records: List[Extra] = []
+    inject_csp: bool = False
 
 
 class Config(BaseModel):
@@ -322,6 +323,22 @@ class Namecheap(BaseProvider):
 
     def set_ns(self, domain: str, ns: List[str]):
         sld, tld = domain.split(".", 1)
+        # check if already to ns
+        ns_list = self._get_all_pages(
+            "namecheap.domains.dns.getList", {"SLD": sld, "TLD": tld}, "Nameserver"
+        )
+        ns_list = [ns.text.lower().rstrip(" ").rstrip(".") for ns in ns_list]
+        count = 0
+        for n in ns:
+            if n.lower().rstrip(" ").rstrip(".") in ns_list:
+                count += 1
+
+        log.info(f"COUNT {count} of {len(ns)}")
+
+        if len(ns) == count:
+            log.info(f"NS {ns} already set for {domain}")
+            return
+
         self._call(
             "namecheap.domains.dns.setCustom",
             {"SLD": sld, "TLD": tld, "Nameservers": ",".join(ns)},
@@ -348,6 +365,9 @@ class NameDotCom(BaseProvider):
         r = requests.get(
             f"{self.API}/domains/{domain}/records", auth=self.auth, headers=self.headers, timeout=60
         )
+        if r.status_code == 400:
+            log.warning(f"Domain {domain} uses other DNS provider")
+            return []
         r.raise_for_status()
         return [
             DNSRecord(
@@ -513,7 +533,7 @@ def cf_email_rules(
                 ok_ids.add(already.id)
                 continue
             else:
-                log.debug(f"Updating {d.payload()} from {already.payload()}")
+                log.debug(f"Updating {d.payload()}")
                 ok_ids.add(already.id)
         else:
             log.info(f"Creating {d.payload()} because {d.key()} not in ({list(existing.keys())})")
@@ -586,44 +606,97 @@ def cf_email_rules(
         )
 
 
+def redirect_to_cf_rule(r: Redirect):
+    if not r.source.startswith("https://"):
+        log.warning(f"Redirect source must start with https://: {r.source}")
+        return
+    parsed = r.source.removeprefix("https://").split("/", 1)
+    host = parsed[0]
+    path = "/" + parsed[1] if len(parsed) > 1 else "/"
+
+    # Create the wildcard pattern for the source
+    source_pattern = f"https://{host}{path}"
+    if path == "/":
+        source_pattern += "*"
+
+    # Create the wildcard pattern for the target
+    target_pattern = r.destination
+    if not target_pattern.endswith("/"):
+        target_pattern += "/"
+    target_pattern += "${1}"
+
+    rule = {
+        "action": "redirect",
+        "action_parameters": {
+            "from_value": {
+                "preserve_query_string": True,
+                "status_code": r.code,
+                "target_url": {
+                    "expression": f'wildcard_replace(http.request.full_uri, r"{source_pattern}", r"{target_pattern}")'
+                },
+            }
+        },
+        "description": f"Redirect from {host}{path} to {r.destination}",
+        "enabled": True,
+        "expression": f'(http.request.full_uri wildcard r"{source_pattern}")',
+    }
+    return rule
+
+
 def cf_bulk_redirect(zone_id: str, redirects: Sequence[Redirect]):
     if not redirects:
         return
-    # create or update a Bulk Redirect list
-    lsts = cf_req(
-        "GET", f"/accounts/{cf_account()}/rules/lists?page=1&per_page=50&match=name&name=url‑tool"
-    )
-    lst = (
-        lsts[0]
-        if lsts
-        else cf_req(
-            "POST",
-            f"/accounts/{cf_account()}/rules/lists",
-            json={"name": "url‑tool", "kind": "redirect"},
+
+    existing = cf_req("GET", f"/zones/{zone_id}/rulesets?phase=http_request_dynamic_redirect")
+    existing_rules = []
+    patch_id = None
+    for rset in existing:
+        if rset["kind"] == "zone" and rset["phase"] == "http_request_dynamic_redirect":
+            patch_id = rset["id"]
+            try:
+                existing_rules.extend(
+                    cf_req("GET", f"/zones/{zone_id}/rulesets/{rset['id']}")["rules"]
+                )
+            except KeyError:
+                pass
+    rules = [redirect_to_cf_rule(r) for r in redirects]
+    have = 0
+    for r in redirects:
+        for rule in existing_rules:
+            log.info(f"Checking {r.source} against {rule['expression']}")
+            if rule["action"] == "redirect":
+                if r.source in rule["expression"]:
+                    log.info(f"Found existing rule for {r.source}: {rule}")
+                    target = rule["action_parameters"]["from_value"]["target_url"]["expression"]
+                    log.info(f"Target: {target}, Destibnation: {r.destination}")
+                    if r.destination.lower() not in target.lower():
+                        log.info(f"Need to update destination from {target} to {r.destination}")
+                    if r.destination.lower() in target.lower():
+                        have += 1
+                        log.info(f"Already have rule for {r.source}")
+                        break
+
+    if len(rules) == have:
+        log.info("Already have all rules")
+        return
+
+    if patch_id:
+        log.info(f"PATCHING IN {rules}")
+        cf_req(
+            "PUT",
+            f"/zones/{zone_id}/rulesets/{patch_id}",
+            json={"rules": rules},
         )
-    )
-    items = [
-        {"source_url": r.source, "target_url": r.destination, "status_code": r.code}
-        for r in redirects
-    ]
-    cf_req("PUT", f"/accounts/{cf_account()}/rules/lists/{lst['id']}", json={"items": items})
-    # attach list as ruleset (once)
-    sets = cf_req("GET", f"/zones/{zone_id}/rulesets?phase=http_request_redirect")
-    if not sets:
+        return
+    else:
         cf_req(
             "POST",
             f"/zones/{zone_id}/rulesets",
             json={
-                "name": "bulk‑redirect",
+                "name": "cftool-redirects",
                 "kind": "zone",
-                "phase": "http_request_redirect",
-                "rules": [
-                    {
-                        "action": "redirect",
-                        "expression": "true",
-                        "action_parameters": {"redirect_list_id": lst["id"]},
-                    }
-                ],
+                "phase": "http_request_dynamic_redirect",
+                "rules": rules,
             },
         )
 
@@ -639,6 +712,89 @@ def cf_account() -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 #  EXPORT
 # ──────────────────────────────────────────────────────────────────────────────
+def get_mailgun_dns_records(domain: str) -> List[DNSRecord]:
+    """Fetch DNS records from Mailgun for a domain.
+
+    If Mailgun has a subdomain of the target domain (e.g. mg.q32.com for q32.com),
+    those records will be included in the export with proper subdomain paths.
+    """
+    api_key = os.environ.get("MAILGUN_API_KEY")
+    if not api_key:
+        return []
+
+    # First get all domains from Mailgun
+    r = requests.get(
+        "https://api.mailgun.net/v3/domains",
+        auth=("api", api_key),
+        timeout=60,
+    )
+    r.raise_for_status()
+    domains = r.json().get("items", [])
+
+    # Find all Mailgun domains that are either the target domain or a subdomain of it
+    mailgun_domains = [
+        d["name"] for d in domains if d["name"] == domain or d["name"].endswith(f".{domain}")
+    ]
+
+    if not mailgun_domains:
+        return []
+
+    records = []
+    for mg_domain in mailgun_domains:
+        # Get the domain's DNS records
+        r = requests.get(
+            f"https://api.mailgun.net/v3/domains/{mg_domain}",
+            auth=("api", api_key),
+            timeout=60,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        # Calculate the subdomain prefix if this is a subdomain
+        subdomain_prefix = ""
+        if mg_domain != domain:
+            # Remove the target domain from the end to get the subdomain prefix
+            subdomain_prefix = mg_domain[: -len(domain) - 1]  # -1 for the dot
+
+        for record in data.get("sending_dns_records", []) + data.get("receiving_dns_records", []):
+            if record["record_type"] == "TXT":
+                # Handle SPF and DKIM records
+                # For subdomains, we need to preserve the full record name
+                base_name = record["name"].rstrip(f".{mg_domain}.") or "@"
+                if base_name == "@" and subdomain_prefix:
+                    name = subdomain_prefix
+                else:
+                    name = f"{base_name}.{subdomain_prefix}" if subdomain_prefix else base_name
+                records.append(
+                    DNSRecord(
+                        type="TXT",
+                        name=name,
+                        content=record["value"],
+                    )
+                )
+            elif record["record_type"] == "MX":
+                # Handle MX records
+                name = subdomain_prefix if subdomain_prefix else "@"
+                records.append(
+                    DNSRecord(
+                        type="MX",
+                        name=name,
+                        content=record["value"],
+                        priority=record.get("priority", 10),
+                    )
+                )
+            elif record["record_type"] == "CNAME":
+                # Handle CNAME records
+                # For subdomains, we need to preserve the full record name
+                base_name = record["name"].rstrip(f".{mg_domain}.")
+                name = f"{base_name}.{subdomain_prefix}" if subdomain_prefix else base_name
+                records.append(
+                    DNSRecord(type="CNAME", name=name, content=record["value"], proxied=False)
+                )
+
+    return records
+
+
 def cmd_export(domains: List[str]) -> None:
     yaml_out = {}
     for dom in domains:
@@ -648,6 +804,13 @@ def cmd_export(domains: List[str]) -> None:
         recs = [r.payload() for r in prov.export_dns(dom)]  # type: ignore[attr-defined]
         fwds = [f.model_dump(by_alias=True, exclude_none=True) for f in prov.export_forward(dom)]  # type: ignore[attr-defined]
         reds = [r.model_dump(by_alias=True, exclude_none=True) for r in prov.export_redirects(dom)]  # type: ignore[attr-defined]
+
+        # Add Mailgun DNS records if available
+        mailgun_recs = get_mailgun_dns_records(dom)
+        if mailgun_recs:
+            log.info(f"Found {len(mailgun_recs)} Mailgun DNS records for {dom}")
+            recs.extend([r.payload() for r in mailgun_recs])
+
         for rec in recs:
             if rec["type"] == "ANAME":
                 # cloudflare will magcally do the right thing
@@ -674,6 +837,118 @@ def cmd_export(domains: List[str]) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 #  APPLY
 # ──────────────────────────────────────────────────────────────────────────────
+def cf_csp_ruleset(zone_id: str, domain: str, inject: bool):
+    """Manage CSP ruleset for a domain.
+
+    This function carefully manages CSP rules while preserving other rules in the ruleset.
+    It will:
+    1. Only delete CSP rules when explicitly disabled
+    2. Preserve all other rules in the ruleset
+    3. Merge CSP rules with existing rules when needed
+    """
+    # Get existing rulesets
+    rulesets = cf_req(
+        "GET", f"/zones/{zone_id}/rulesets?phase=http_response_headers_transform", json={}
+    )
+
+    log.info(f"Rulesets: {rulesets}")
+
+    # Find existing CSP ruleset
+    csp_ruleset = None
+    for rs in rulesets:
+        if rs["name"] == "Add CSP header":
+            csp_ruleset = rs
+            break
+
+    csp_rule = {
+        "expression": "true",
+        "action": "rewrite",
+        "action_parameters": {
+            "headers": {
+                "Content-Security-Policy": {"operation": "set", "value": "frame-ancestors 'self'"}
+            }
+        },
+        "enabled": True,
+        "description": "Set CSP to disallow iframing by other domains",
+    }
+
+    if not inject:
+        if csp_ruleset:
+            # Fetch the rules for this ruleset
+            ruleset_details = cf_req(
+                "GET", f"/zones/{zone_id}/rulesets/{csp_ruleset['id']}", json={}
+            )
+            rules = ruleset_details.get("rules", [])
+
+            # Remove just the CSP rule while preserving others
+            log.info(f"Removing CSP rule from ruleset for {domain} while preserving other rules")
+            other_rules = [
+                r
+                for r in rules
+                if not (
+                    r.get("action") == "rewrite"
+                    and "Content-Security-Policy"
+                    in r.get("action_parameters", {}).get("headers", {})
+                )
+            ]
+            if not other_rules:
+                log.info(f"No other rules in ruleset for {domain}, deleting ruleset")
+                cf_req("DELETE", f"/zones/{zone_id}/rulesets/{csp_ruleset['id']}")
+                return
+            cf_req(
+                "PUT",
+                f"/zones/{zone_id}/rulesets/{csp_ruleset['id']}",
+                json={
+                    "name": csp_ruleset["name"],
+                    "kind": "zone",
+                    "phase": "http_response_headers_transform",
+                    "rules": other_rules,
+                },
+            )
+        return
+
+    if csp_ruleset:
+        # Fetch the rules for this ruleset
+        ruleset_details = cf_req("GET", f"/zones/{zone_id}/rulesets/{csp_ruleset['id']}", json={})
+        rules = ruleset_details.get("rules", [])
+
+        # Check if CSP rule already exists
+        has_csp = any(
+            r.get("action") == "rewrite"
+            and "Content-Security-Policy" in r.get("action_parameters", {}).get("headers", {})
+            for r in rules
+        )
+
+        if not has_csp:
+            # Add CSP rule to existing ruleset
+            log.info(f"Adding CSP rule to existing ruleset for {domain}")
+            cf_req(
+                "PUT",
+                f"/zones/{zone_id}/rulesets/{csp_ruleset['id']}",
+                json={
+                    "name": csp_ruleset["name"],
+                    "kind": "zone",
+                    "phase": "http_response_headers_transform",
+                    "rules": rules + [csp_rule],
+                },
+            )
+        else:
+            log.info(f"CSP rule already exists in ruleset for {domain}")
+    else:
+        # Create new ruleset with CSP rule
+        log.info(f"Creating new CSP ruleset for {domain}")
+        cf_req(
+            "POST",
+            f"/zones/{zone_id}/rulesets",
+            json={
+                "name": "Add CSP header",
+                "kind": "zone",
+                "phase": "http_response_headers_transform",
+                "rules": [csp_rule],
+            },
+        )
+
+
 def cmd_apply(cfg_path: Path, dry: bool = False):
     cfg = Config.model_validate(yaml.safe_load(cfg_path.read_text()))
 
@@ -714,10 +989,12 @@ def cmd_apply(cfg_path: Path, dry: bool = False):
             log.info(f"Creating email forwarding rules for {site.mail_forwarding}")
             if not dry:
                 cf_email_rules(zid, site.mail_forwarding, existing, dom)
+        log.info(f"Managing CSP ruleset for {dom}")
+        if not dry:
+            cf_csp_ruleset(zid, dom, site.inject_csp)
         if site.url_redirects:
             log.info(f"Creating bulk redirect for {site.url_redirects}")
             if not dry:
-                raise  # untested
                 cf_bulk_redirect(zid, site.url_redirects)
         if not dry:
             log.info(f"Setting NS for {dom}")

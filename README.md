@@ -90,6 +90,7 @@ domains:
       - source: https://old.example.com
         destination: https://new.example.com
         code: 301
+    inject_csp: true  # Optional: Enable CSP header to prevent iframing
 ```
 
 ## Development
@@ -98,6 +99,14 @@ domains:
 - Poetry for dependency management
 - Uses async/await for API calls
 - Rich for terminal output
+
+## Environment Variables
+
+- `NC_API_USER`: Namecheap API username
+- `NC_API_KEY`: Namecheap API key
+- `NAMEDOTCOM_USER`: Name.com API username
+- `NAMEDOTCOM_TOKEN`: Name.com API token
+- `MAILGUN_API_KEY`: Mailgun API key (optional, for fetching Mailgun DNS records)
 
 ## License
 
