@@ -12,7 +12,7 @@ repos:
     rev: 24.1.1
     hooks:
       - id: black
-        language_version: python3.12
+        language_version: python3.13
         args: [--line-length=100]
 
   - repo: https://github.com/pycqa/isort
@@ -28,6 +28,5 @@ repos:
         args: [
           --fix,
           --exit-non-zero-on-fix,
-          --line-length=120,
-          --target-version=py312,
+          --line-length=120
         ]

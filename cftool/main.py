@@ -12,6 +12,7 @@ Dependencies: requests pydantic[dotenv] PyYAML rich
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import os
 import re
@@ -178,6 +179,7 @@ class Extra(BaseModel):
 
 class Site(BaseModel):
     registrar: str
+    dns_provider: str | None = None
     cache_bypass: List[str] = []
     records: List[Extra] = []
     mail_forwarding: List[Forward] = []
@@ -214,8 +216,8 @@ class Namecheap(BaseProvider):
     API = "https://api.namecheap.com/xml.response"
 
     def __init__(self):
-        self.u = os.environ["NC_API_USER"]
-        self.k = os.environ["NC_API_KEY"]
+        self.u = os.environ.get("NC_API_USER")
+        self.k = os.environ.get("NC_API_KEY")
         self.headers = {
             "User-Agent": "cftool/1.0",
         }
@@ -223,6 +225,8 @@ class Namecheap(BaseProvider):
         self._cache = {}
 
     def _call(self, cmd: str, params: Dict) -> str:
+        if not self.u or not self.k:
+            raise RuntimeError("Namecheap env vars missing: set NC_API_USER and NC_API_KEY")
         p = {
             "ApiUser": self.u,
             "ApiKey": self.k,
@@ -349,19 +353,86 @@ class NameDotCom(BaseProvider):
     API = "https://api.name.com/v4"
 
     def __init__(self):
-        self.auth = (os.environ["NAMEDOTCOM_USER"], os.environ["NAMEDOTCOM_TOKEN"])
+        u = os.environ.get("NAMEDOTCOM_USER")
+        t = os.environ.get("NAMEDOTCOM_TOKEN")
+        self.auth = (u, t)
         self.headers = {
             "User-Agent": "cftool/1.0",
         }
 
+    def _require_auth(self):
+        if not self.auth[0] or not self.auth[1]:
+            raise RuntimeError(
+                "Name.com env vars missing: set NAMEDOTCOM_USER and NAMEDOTCOM_TOKEN"
+            )
+
+    def _request(self, method: str, path: str, **kwargs):
+        self._require_auth()
+        r = requests.request(
+            method,
+            f"{self.API}{path}",
+            auth=self.auth,
+            headers=self.headers,
+            timeout=60,
+            **kwargs,
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(r.text)
+        return r
+
+    def list_domains(self) -> list[dict]:
+        self._require_auth()
+        domains = []
+        page = 1
+        while True:
+            r = self._request("GET", "/domains", params={"perPage": 1000, "page": page})
+            data = r.json()
+            domains.extend(data.get("domains", []))
+            next_page = data.get("nextPage")
+            if not next_page:
+                break
+            page = next_page
+        return domains
+
+    def get_domain(self, domain: str) -> dict:
+        r = self._request("GET", f"/domains/{domain}")
+        return r.json()
+
+    def get_auth_code(self, domain: str) -> str:
+        r = self._request("GET", f"/domains/{domain}:getAuthCode")
+        return r.json()["authCode"]
+
+    def unlock(self, domain: str) -> None:
+        self._require_auth()
+        r = requests.post(
+            f"{self.API}/domains/{domain}:unlock",
+            auth=self.auth,
+            headers=self.headers,
+            timeout=60,
+        )
+        if r.status_code == 404:
+            r = requests.patch(
+                f"{self.API}/domains/{domain}",
+                auth=self.auth,
+                headers=self.headers,
+                json={"locked": False},
+                timeout=60,
+            )
+        if r.status_code >= 400:
+            raise RuntimeError(r.text)
+
     def has_domain(self, domain: str) -> bool:
+        self._require_auth()
         r = requests.get(
             f"{self.API}/domains/{domain}", auth=self.auth, headers=self.headers, timeout=60
         )
+        if r.status_code in (400, 404):
+            return False
         r.raise_for_status()
-        return r.status_code == 200
+        return True
 
     def export_dns(self, domain: str) -> list[DNSRecord]:
+        self._require_auth()
         r = requests.get(
             f"{self.API}/domains/{domain}/records", auth=self.auth, headers=self.headers, timeout=60
         )
@@ -381,6 +452,7 @@ class NameDotCom(BaseProvider):
         ]
 
     def export_forward(self, domain: str) -> list[Forward]:
+        self._require_auth()
         mx_required = f"mx.{domain}.cust.a.hostedemail.com"
         active_mx = any(
             r
@@ -403,6 +475,7 @@ class NameDotCom(BaseProvider):
         return [Forward(from_=f["emailBox"] + f"@{domain}", to=f["emailTo"]) for f in data]
 
     def export_redirects(self, domain: str) -> list[Redirect]:
+        self._require_auth()
         r = requests.get(
             f"{self.API}/domains/{domain}/url/forwarding",
             auth=self.auth,
@@ -420,6 +493,7 @@ class NameDotCom(BaseProvider):
         return redirects
 
     def set_ns(self, domain: str, ns: List[str]):
+        self._require_auth()
         r = requests.post(
             f"{self.API}/domains/{domain}:setNameservers",
             auth=self.auth,
@@ -468,6 +542,11 @@ def cf_zone(domain: str) -> Dict:
         if z
         else cf_req("POST", "/zones", json={"name": domain, "account": {"id": cf_account()}})
     )
+
+
+def cf_zone_lookup(domain: str) -> Dict | None:
+    z = cf_req("GET", f"/zones?name={domain}")
+    return z[0] if z else None
 
 
 def cf_records(zone_id: str, domain: str) -> Dict[tuple, DNSRecord]:
@@ -606,6 +685,50 @@ def cf_email_rules(
         )
 
 
+def cf_export_email_forwarding(zone_id: str, domain: str) -> list[Forward]:
+    fwds: list[Forward] = []
+
+    try:
+        cf_catch_all = cf_req("GET", f"/zones/{zone_id}/email/routing/rules/catch_all")
+    except RuntimeError:
+        cf_catch_all = None
+    if cf_catch_all and cf_catch_all.get("enabled"):
+        to = cf_catch_all["actions"][0]["value"][0]
+        fwds.append(Forward(from_=f"*@{domain}", to=to))
+
+    try:
+        rules = cf_req("GET", f"/zones/{zone_id}/email/routing/rules")
+    except RuntimeError:
+        rules = []
+    for r in rules:
+        if not r.get("enabled"):
+            continue
+        to: str | None = None
+        for a in r.get("actions", []):
+            if a.get("type") == "forward":
+                to = a.get("value", [None])[0]
+                break
+        if not to:
+            continue
+        for match in r.get("matchers", []):
+            if match.get("type") == "literal" and match.get("field") == "to":
+                fwds.append(Forward(from_=match["value"].lower(), to=to))
+    return fwds
+
+
+def is_cf_email_routing_dns_record(r: DNSRecord) -> bool:
+    if r.type == "MX":
+        return r.content.rstrip(".").lower() in {
+            "route1.mx.cloudflare.net",
+            "route2.mx.cloudflare.net",
+            "route3.mx.cloudflare.net",
+        }
+    if r.type == "TXT":
+        c = r.content.lower()
+        return "include:_spf.mx.cloudflare.net" in c or "v=dkim1" in c
+    return False
+
+
 def redirect_to_cf_rule(r: Redirect):
     if not r.source.startswith("https://"):
         log.warning(f"Redirect source must start with https://: {r.source}")
@@ -703,6 +826,8 @@ def cf_bulk_redirect(zone_id: str, redirects: Sequence[Redirect]):
 
 @lru_cache(maxsize=1)
 def cf_account() -> str:
+    if account_id := os.environ.get("CF_ACCOUNT_ID"):
+        return account_id
     zs = cf_req("GET", "/zones")
     for z in zs:
         return z["account"]["id"]
@@ -798,12 +923,48 @@ def get_mailgun_dns_records(domain: str) -> List[DNSRecord]:
 def cmd_export(domains: List[str]) -> None:
     yaml_out = {}
     for dom in domains:
-        prov_name = detect_provider(dom)
-        prov = PROVIDERS[prov_name]
-        log.info(f"Export {dom} via {prov_name}")
-        recs = [r.payload() for r in prov.export_dns(dom)]  # type: ignore[attr-defined]
-        fwds = [f.model_dump(by_alias=True, exclude_none=True) for f in prov.export_forward(dom)]  # type: ignore[attr-defined]
-        reds = [r.model_dump(by_alias=True, exclude_none=True) for r in prov.export_redirects(dom)]  # type: ignore[attr-defined]
+        registrar_name = detect_provider(dom)
+        prov = PROVIDERS[registrar_name]
+
+        dns_provider = registrar_name
+        zid: str | None = None
+        log.info(f"Export {dom} via registrar={registrar_name}")
+
+        dns_records = list(prov.export_dns(dom))  # type: ignore[attr-defined]
+        if not dns_records:
+            zone = cf_zone_lookup(dom)
+            if zone:
+                dns_provider = "cloudflare"
+                zid = zone["id"]
+                log.info(
+                    f"Registrar DNS export empty for {dom}; exporting DNS from Cloudflare zone {zid}"
+                )
+                dns_records = list(cf_records(zid, dom).values())
+
+        if dns_provider == "cloudflare" and zid:
+            cf_fwds = cf_export_email_forwarding(zid, dom)
+            if cf_fwds:
+                log.info(
+                    f"Cloudflare email routing enabled for {dom}; collapsing to mail_forwarding and dropping expanded DNS records"
+                )
+                dns_records = [r for r in dns_records if not is_cf_email_routing_dns_record(r)]
+                fwds = [f.model_dump(by_alias=True, exclude_none=True) for f in cf_fwds]
+            else:
+                fwds = [
+                    f.model_dump(by_alias=True, exclude_none=True)
+                    for f in prov.export_forward(dom)  # type: ignore[attr-defined]
+                ]
+        else:
+            fwds = [
+                f.model_dump(by_alias=True, exclude_none=True)
+                for f in prov.export_forward(dom)  # type: ignore[attr-defined]
+            ]
+
+        recs = [r.payload() for r in dns_records]
+        reds = [
+            r.model_dump(by_alias=True, exclude_none=True)
+            for r in prov.export_redirects(dom)  # type: ignore[attr-defined]
+        ]
 
         # Add Mailgun DNS records if available
         mailgun_recs = get_mailgun_dns_records(dom)
@@ -815,16 +976,17 @@ def cmd_export(domains: List[str]) -> None:
             if rec["type"] == "ANAME":
                 # cloudflare will magcally do the right thing
                 rec["type"] = "CNAME"
-            if rec["type"] == "CNAME":
+            if rec["type"] == "CNAME" and "proxied" not in rec:
                 rec["proxied"] = True
-            if rec["type"] == "A" and rec["name"] == "@":
+            if rec["type"] == "A" and rec["name"] == "@" and "proxied" not in rec:
                 rec["proxied"] = True
-            if rec["type"] == "AAAA" and rec["name"] == "@":
+            if rec["type"] == "AAAA" and rec["name"] == "@" and "proxied" not in rec:
                 rec["proxied"] = True
             if rec["type"] not in ("MX", "SRV", "URI"):
                 rec.pop("priority", None)
         yaml_out[dom] = {
-            "registrar": prov_name,
+            "registrar": registrar_name,
+            "dns_provider": dns_provider,
             "records": recs,
         }
         if fwds:
@@ -1006,6 +1168,126 @@ def cmd_apply(cfg_path: Path, dry: bool = False):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  NAME.COM -> CLOUDFLARE REGISTRAR TRANSFER PREP
+# ──────────────────────────────────────────────────────────────────────────────
+def _normalize_nameservers(nameservers: Sequence[str]) -> list[str]:
+    return sorted(ns.lower().rstrip(".") for ns in nameservers)
+
+
+def _write_csv(
+    path: Path, rows: list[dict], fields: Sequence[str], sensitive: bool = False
+) -> None:
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
+    if sensitive:
+        path.chmod(0o600)
+
+
+def cmd_transfer_namecom(
+    *,
+    execute: bool = False,
+    auth_codes_path: Path | None = None,
+    report_path: Path = Path("namecom-transfer-plan.csv"),
+) -> None:
+    namedotcom = PROVIDERS["name.com"]
+    if not isinstance(namedotcom, NameDotCom):
+        raise RuntimeError("name.com provider is not configured")
+
+    domains = sorted(d["domainName"].lower() for d in namedotcom.list_domains())
+    log.info(f"Found {len(domains)} domains in Name.com")
+
+    report_rows: list[dict] = []
+    auth_rows: list[dict] = []
+
+    for domain in domains:
+        row = {
+            "domain": domain,
+            "action": "plan" if not execute else "execute",
+            "cf_zone_id": "",
+            "cf_zone_status": "",
+            "cloudflare_nameservers": "",
+            "current_nameservers": "",
+            "nameservers_match": False,
+            "locked_before": "",
+            "unlocked": False,
+            "auth_code_written": False,
+            "error": "",
+        }
+        try:
+            nd_domain = namedotcom.get_domain(domain)
+            current_ns = nd_domain.get("nameservers", [])
+            row["current_nameservers"] = ",".join(current_ns)
+            row["locked_before"] = nd_domain.get("locked", "")
+
+            zone = cf_zone(domain) if execute else cf_zone_lookup(domain)
+            if not zone:
+                row["action"] = "would_create_cloudflare_zone"
+                report_rows.append(row)
+                log.info(f"{domain}: would create Cloudflare zone")
+                continue
+
+            cf_ns = zone.get("name_servers", [])[:2]
+            row["cf_zone_id"] = zone["id"]
+            row["cf_zone_status"] = zone.get("status", "")
+            row["cloudflare_nameservers"] = ",".join(cf_ns)
+            row["nameservers_match"] = _normalize_nameservers(current_ns) == _normalize_nameservers(
+                cf_ns
+            )
+
+            if execute and cf_ns and not row["nameservers_match"]:
+                namedotcom.set_ns(domain, cf_ns)
+                row["nameservers_match"] = True
+                log.info(f"{domain}: set Name.com nameservers to {', '.join(cf_ns)}")
+
+            if execute and nd_domain.get("locked"):
+                namedotcom.unlock(domain)
+                row["unlocked"] = True
+                log.info(f"{domain}: unlocked for transfer")
+
+            if auth_codes_path:
+                auth_code = namedotcom.get_auth_code(domain)
+                auth_rows.append({"domain": domain, "auth_code": auth_code})
+                row["auth_code_written"] = True
+
+            if zone.get("status") != "active":
+                row["action"] = "wait_for_cloudflare_active"
+                log.info(
+                    f"{domain}: Cloudflare zone status is {zone.get('status')}; transfer waits for Active"
+                )
+            elif auth_codes_path:
+                row["action"] = "ready_for_cloudflare_dashboard_transfer"
+            else:
+                row["action"] = "ready_for_auth_code_fetch"
+        except Exception as exc:
+            row["action"] = "error"
+            row["error"] = str(exc)
+            log.error(f"{domain}: {exc}")
+        report_rows.append(row)
+
+    report_fields = [
+        "domain",
+        "action",
+        "cf_zone_id",
+        "cf_zone_status",
+        "cloudflare_nameservers",
+        "current_nameservers",
+        "nameservers_match",
+        "locked_before",
+        "unlocked",
+        "auth_code_written",
+        "error",
+    ]
+    _write_csv(report_path, report_rows, report_fields)
+    log.info(f"Wrote transfer report to {report_path}")
+
+    if auth_codes_path:
+        _write_csv(auth_codes_path, auth_rows, ["domain", "auth_code"], sensitive=True)
+        log.info(f"Wrote {len(auth_rows)} auth codes to {auth_codes_path} with mode 0600")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  CLI
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
@@ -1018,14 +1300,38 @@ def main():
     aply.add_argument("config", type=Path)
     aply.add_argument("--dry", action="store_true")
     aply.add_argument("--debug", "-D", action="store_true")
+    tr = sub.add_parser("transfer-namecom")
+    tr.add_argument(
+        "--execute",
+        action="store_true",
+        help="Create missing Cloudflare zones, set Name.com nameservers, and unlock domains.",
+    )
+    tr.add_argument(
+        "--auth-codes",
+        type=Path,
+        help="Write transfer auth/EPP codes to this CSV. The file is chmod 0600.",
+    )
+    tr.add_argument(
+        "--report",
+        type=Path,
+        default=Path("namecom-transfer-plan.csv"),
+        help="Write a per-domain transfer prep report to this CSV.",
+    )
+    tr.add_argument("--debug", "-D", action="store_true")
     args = ap.parse_args()
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
         log.debug(args)
     if args.cmd == "export":
         cmd_export(args.domains)
-    else:
+    elif args.cmd == "apply":
         cmd_apply(args.config, args.dry)
+    else:
+        cmd_transfer_namecom(
+            execute=args.execute,
+            auth_codes_path=args.auth_codes,
+            report_path=args.report,
+        )
 
 
 if __name__ == "__main__":

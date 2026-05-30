@@ -67,13 +67,29 @@ For a dry run (no changes):
 python -m cftool apply config.yml --dry
 ```
 
+### Prepare Name.com Registrar Transfers
+
+Inspect all Name.com registrar domains and write a transfer-prep report without changing anything:
+
+```bash
+python -m cftool transfer-namecom --report namecom-transfer-plan.csv
+```
+
+Create missing Cloudflare zones, update Name.com nameservers to Cloudflare, unlock the domains, and write auth/EPP codes to a private CSV:
+
+```bash
+python -m cftool transfer-namecom --execute --auth-codes namecom-auth-codes.csv
+```
+
+Cloudflare still requires the final registrar transfer submission, contact confirmation, and payment confirmation in the Transfer Domains dashboard.
+
 ## YAML Configuration Format
 
 ```yaml
 domains:
   example.com:
-    dns_provider: namecheap  # or name.com
-    origin: origin.example.com  # optional
+    registrar: namecheap  # or name.com; used for flipping nameservers during `apply`
+    dns_provider: cloudflare  # optional; when present, documents where DNS was exported from
     cache_bypass:  # optional
       - /api/*
       - /static/*

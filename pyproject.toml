@@ -6,7 +6,7 @@ authors = ["erik aronesty <erik@q32.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.12"
+python = "^3.13"
 requests = "^2.32.3"
 pydantic = "^2.11.4"
 python-dotenv = "^1.1.0"
