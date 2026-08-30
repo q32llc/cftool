@@ -4,3 +4,5 @@ junk/
 __pycache__/
 venv/
 node_modules/
+namecom-auth-codes.csv
+namecom-transfer-plan.csv
