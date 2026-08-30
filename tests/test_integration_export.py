@@ -229,3 +229,54 @@ def test_cmd_transfer_namecom_execute_writes_auth_codes_private(monkeypatch, tmp
     ]
     assert auth_codes.read_text() == "domain,auth_code\nexample.com,secret-epp\n"
     assert oct(auth_codes.stat().st_mode & 0o777) == "0o600"
+
+
+def test_cmd_transfer_namecom_execute_unlocks_when_lock_field_missing(monkeypatch, tmp_path):
+    monkeypatch.setenv("CF_API_TOKEN", "test-token")
+    monkeypatch.setenv("NAMEDOTCOM_USER", "user")
+    monkeypatch.setenv("NAMEDOTCOM_TOKEN", "token")
+
+    def fake_get(url, *args, **kwargs):
+        if url == "https://checkip.amazonaws.com":
+            return _Resp(text="203.0.113.10\n")
+        raise AssertionError(f"unexpected GET {url}")
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    m = importlib.import_module("cftool.main")
+    provider = m.NameDotCom()
+    calls = []
+    monkeypatch.setattr(provider, "list_domains", lambda: [{"domainName": "example.com"}])
+    monkeypatch.setattr(
+        provider,
+        "get_domain",
+        lambda domain: {
+            "domainName": domain,
+            "nameservers": ["ada.ns.cloudflare.com", "bob.ns.cloudflare.com"],
+        },
+    )
+    monkeypatch.setattr(provider, "set_ns", lambda domain, ns: calls.append(("set_ns", domain, ns)))
+    monkeypatch.setattr(provider, "unlock", lambda domain: calls.append(("unlock", domain)))
+    monkeypatch.setattr(m, "PROVIDERS", {"name.com": provider})
+    monkeypatch.setattr(
+        m,
+        "cf_zone",
+        lambda domain: {
+            "id": "zone-1",
+            "status": "active",
+            "name_servers": ["ada.ns.cloudflare.com", "bob.ns.cloudflare.com"],
+        },
+    )
+
+    m.cmd_transfer_namecom(execute=True, report_path=tmp_path / "plan.csv")
+
+    assert calls == [("unlock", "example.com")]
+
+
+def test_cf_zone_query_includes_account_id(monkeypatch):
+    m = importlib.import_module("cftool.main")
+    monkeypatch.setattr(m, "CF_ACCOUNT_ID", "acct-123")
+
+    query = m.cf_zone_query("example.com")
+
+    assert query == "/zones?name=example.com&account.id=acct-123"

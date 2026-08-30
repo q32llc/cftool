@@ -31,6 +31,8 @@ Create a `.env` file with the following variables:
 ```env
 # Cloudflare
 CF_API_TOKEN=your_cloudflare_api_token
+CF_ACCOUNT_ID=your_cloudflare_account_id
+# CLOUDFLARE_ACCOUNT_ID is also accepted.
 
 # Namecheap (if using)
 NC_API_USER=your_namecheap_api_user

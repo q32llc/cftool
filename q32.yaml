@@ -1,0 +1,101 @@
+domains:
+  q32.com:
+    registrar: name.com
+    records:
+    - type: TXT
+      name: '@'
+      content: google-site-verification=GxvIWcuaZyWqj66D4uhpylgSR6ndL2EpAD3ebYCw4dY
+    - type: TXT
+      name: '@'
+      content: keybase-site-verification=7xlAdKCQQSksFDTSlgb-YXN9A2GcRjLCoUojQe2WEJQ
+    - type: CNAME
+      name: '@'
+      content: q32.fly.dev
+      proxied: true
+    - type: CNAME
+      name: www
+      content: q32.fly.dev
+      proxied: true
+    - type: MX
+      name: '@'
+      content: aspmx.l.google.com
+      ttl: 3600
+      priority: 1
+    - type: MX
+      name: '@'
+      content: alt1.aspmx.l.google.com
+      ttl: 3600
+      priority: 5
+    - type: MX
+      name: '@'
+      content: alt2.aspmx.l.google.com
+      ttl: 3600
+      priority: 5
+    - type: MX
+      name: '@'
+      content: aspmx2.googlemail.com
+      ttl: 3600
+      priority: 10
+    - type: MX
+      name: '@'
+      content: aspmx3.googlemail.com
+      ttl: 3600
+      priority: 10
+    - type: TXT
+      name: '@'
+      content: v=spf1 a mx include:_spf.google.com ~all
+    - type: CNAME
+      name: tank
+      content: qtank.fly.dev
+      proxied: true
+    - type: CNAME
+      name: meme
+      content: qmemes.fly.dev
+      proxied: true
+    - type: CNAME
+      name: starkill
+      content: q32.fly.dev
+      proxied: true
+    - type: CNAME
+      name: _acme-challenge.starkill
+      content: starkill.q32.com.yl25kn.flydns.net
+    - type: CNAME
+      name: _acme-challenge.cv
+      content: cv.q32.com.yl25kn.flydns.net
+    - type: CNAME
+      name: _acme-challenge.coderev
+      content: coderev.q32.com.yl25kn.flydns.net
+    - type: CNAME
+      name: _acme-challenge.tank
+      content: tank.q32.com.yl25kn.flydns.net
+    - type: CNAME
+      name: coderev
+      content: qcoderev.fly.dev
+      proxied: true
+    - type: CNAME
+      name: cv
+      content: cvmatch.fly.dev
+      proxied: false
+    - type: CNAME
+      name: pdk1._domainkey.mg
+      content: pdk1._domainkey.baaba.dkim2.us.mgsend.org
+      proxied: false
+    - type: CNAME
+      name: pdk2._domainkey.mg
+      content: pdk2._domainkey.baaba.dkim2.us.mgsend.org
+      proxied: false
+    - type: TXT
+      name: mg
+      content: v=spf1 include:mailgun.org ~all
+    - type: CNAME
+      name: email.mg
+      content: mailgun.org
+      proxied: false
+    - type: MX
+      name: mg
+      content: mxa.mailgun.org
+      priority: '10'
+    - type: MX
+      name: mg
+      content: mxb.mailgun.org
+      priority: '10'

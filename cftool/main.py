@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Sequence
+from urllib.parse import urlencode
 
 import requests
 import yaml
@@ -35,6 +36,7 @@ from pydantic import BaseModel, Field
 load_dotenv()
 
 CF_API_TOKEN = os.environ["CF_API_TOKEN"]
+CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID") or os.environ.get("CLOUDFLARE_ACCOUNT_ID")
 CF_API = "https://api.cloudflare.com/client/v4"
 
 log = logging.getLogger("cftool")
@@ -535,8 +537,15 @@ def cf_req(m: str, p: str, **kw):
     return data["result"]
 
 
+def cf_zone_query(domain: str) -> str:
+    params = {"name": domain}
+    if CF_ACCOUNT_ID:
+        params["account.id"] = CF_ACCOUNT_ID
+    return "/zones?" + urlencode(params)
+
+
 def cf_zone(domain: str) -> Dict:
-    z = cf_req("GET", f"/zones?name={domain}")
+    z = cf_req("GET", cf_zone_query(domain))
     return (
         z[0]
         if z
@@ -545,7 +554,7 @@ def cf_zone(domain: str) -> Dict:
 
 
 def cf_zone_lookup(domain: str) -> Dict | None:
-    z = cf_req("GET", f"/zones?name={domain}")
+    z = cf_req("GET", cf_zone_query(domain))
     return z[0] if z else None
 
 
@@ -826,8 +835,8 @@ def cf_bulk_redirect(zone_id: str, redirects: Sequence[Redirect]):
 
 @lru_cache(maxsize=1)
 def cf_account() -> str:
-    if account_id := os.environ.get("CF_ACCOUNT_ID"):
-        return account_id
+    if CF_ACCOUNT_ID:
+        return CF_ACCOUNT_ID
     zs = cf_req("GET", "/zones")
     for z in zs:
         return z["account"]["id"]
@@ -1241,7 +1250,7 @@ def cmd_transfer_namecom(
                 row["nameservers_match"] = True
                 log.info(f"{domain}: set Name.com nameservers to {', '.join(cf_ns)}")
 
-            if execute and nd_domain.get("locked"):
+            if execute:
                 namedotcom.unlock(domain)
                 row["unlocked"] = True
                 log.info(f"{domain}: unlocked for transfer")

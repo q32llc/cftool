@@ -1,0 +1,17 @@
+domains:
+  zypley.com:
+    registrar: namecheap
+    records:
+    - type: CNAME
+      name: '@'
+      content: daabteu1.up.railway.app.
+      ttl: 300
+      proxied: true
+    - type: CNAME
+      name: www
+      content: pkdupqj7.up.railway.app.
+      ttl: 1800
+      proxied: true
+    mail_forwarding:
+    - from: '*@zypley.com'
+      to: earonesty@gmail.com

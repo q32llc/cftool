@@ -1,0 +1,22 @@
+domains:
+  domainspotter.com:
+    inject_csp: True
+    registrar: namecheap
+    records:
+    - type: CNAME
+      name: www
+      content: domainspotter.fly.dev.
+      ttl: 1799
+      proxied: true
+    - type: CNAME
+      name: _acme-challenge.www
+      content: www.domainspotter.com.o30der.flydns.net
+    - type: CNAME
+      name: _acme-challenge
+      content: domainspotter.com.o30der.flydns.net.
+    mail_forwarding:
+    - from: '*@domainspotter.com'
+      to: earonesty@gmail.com
+    url_redirects:
+    - source: https://domainspotter.com
+      destination: https://www.domainspotter.com

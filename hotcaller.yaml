@@ -1,0 +1,33 @@
+domains:
+  hotcaller.com:
+    registrar: namecheap
+    dns_provider: cloudflare
+    records:
+    - type: A
+      name: '@'
+      content: 66.241.124.75
+      ttl: 1
+      proxied: true
+    - type: AAAA
+      name: '@'
+      content: 2a09:8280:1::47:dc43:0
+      ttl: 1
+      proxied: true
+    - type: CNAME
+      name: _acme-challenge
+      content: hotcaller.com.yl25kn.flydns.net
+      ttl: 1799
+      proxied: false
+    - type: CNAME
+      name: _acme-challenge.www
+      content: www.hotcaller.com.yl25kn.flydns.net
+      ttl: 1799
+      proxied: false
+    - type: CNAME
+      name: www
+      content: q32.fly.dev
+      ttl: 1
+      proxied: true
+    mail_forwarding:
+      - from: '*@hotcaller.com'
+        to: earonesty@gmail.com

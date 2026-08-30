@@ -1,0 +1,32 @@
+domains:
+  outerwill.com:
+    registrar: namecheap
+    records:
+    - type: A
+      name: '@'
+      content: 66.241.124.75
+      ttl: 1799
+      proxied: true
+    - type: AAAA
+      name: '@'
+      content: 2a09:8280:1::47:dc43:0
+      ttl: 1799
+      proxied: true
+    - type: CNAME
+      name: www
+      content: q32.fly.dev.
+      ttl: 1799
+      proxied: true
+    - type: CNAME
+      name: _acme-challenge
+      content: outerwill.com.yl25kn.flydns.net
+      ttl: 1799
+      proxied: false
+    - type: CNAME
+      name: _acme-challenge.www
+      content: www.outerwill.com.yl25kn.flydns.net
+      ttl: 1799
+      proxied: false
+    mail_forwarding:
+    - from: '*@outerwill.com'
+      to: earonesty@gmail.com

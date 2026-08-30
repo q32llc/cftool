@@ -1,0 +1,32 @@
+domains:
+  bobchart.com:
+    registrar: namecheap
+    records:
+    - type: A
+      name: '@'
+      content: 66.241.125.121
+      ttl: 1799
+      proxied: true
+    - type: AAAA
+      name: '@'
+      content: 2a09:8280:1::48:374c:0
+      ttl: 1799
+      proxied: true
+    - type: CNAME
+      name: www
+      content: d3wgkd.bobchart.fly.dev
+      ttl: 1799
+      proxied: true
+    - type: CNAME
+      name: _acme-challenge
+      content: bobchart.com.d3wgkd.flydns.net
+      ttl: 1799
+      proxied: false
+    - type: CNAME
+      name: _acme-challenge.www
+      content: www.bobchart.com.d3wgkd.flydns.net
+      ttl: 1799
+      proxied: false
+    mail_forwarding:
+      - from: '*@bobchart.com'
+        to: earonesty@gmail.com
